@@ -40,6 +40,7 @@
 #include "parser/parse_type.h"
 #include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
+#include "executor/spi.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -62,8 +63,8 @@ typedef struct
 } DR_intorel;
 
 /* utility functions for IMMV definition creation */
-static ObjectAddress create_immv_internal(List *attrList, IntoClause *into);
-static ObjectAddress create_immv_nodata(List *tlist, IntoClause *into);
+static ObjectAddress create_immv_internal(List *attrList, IntoClause *into, const char *key_field);
+static ObjectAddress create_immv_nodata(List *tlist, IntoClause *into, const char *key_field);
 
 typedef struct
 {
@@ -86,8 +87,9 @@ static bool check_ivm_restriction_walker(Node *node, check_ivm_restriction_conte
 static Bitmapset *get_primary_key_attnos_from_query(Query *query, List **constraintList);
 static bool is_equijoin_condition(OpExpr *op, check_ivm_restriction_context *context);
 static bool check_aggregate_supports_ivm(Oid aggfnoid);
+static void validate_key_field(Query *query, List *colNames, const char *key_field);
 
-static void StoreImmvQuery(Oid viewOid, Query *viewQuery);
+static void StoreImmvQuery(Oid viewOid, Query *viewQuery, const char *key_field);
 
 #if defined(PG_VERSION_NUM) && (PG_VERSION_NUM < 140000)
 static bool CreateTableAsRelExists(CreateTableAsStmt *ctas);
@@ -102,7 +104,7 @@ static bool CreateTableAsRelExists(CreateTableAsStmt *ctas);
  * This imitates PostgreSQL's create_ctas_internal().
  */
 static ObjectAddress
-create_immv_internal(List *attrList, IntoClause *into)
+create_immv_internal(List *attrList, IntoClause *into, const char *key_field)
 {
 	CreateStmt *create = makeNode(CreateStmt);
 	char		relkind;
@@ -159,9 +161,9 @@ create_immv_internal(List *attrList, IntoClause *into)
 
 	/* Create the "view" part of an IMMV. */
 #if defined(PG_VERSION_NUM) && (PG_VERSION_NUM >= 180000)
-	StoreImmvQuery(intoRelationAddr.objectId, into->viewQuery);
+	StoreImmvQuery(intoRelationAddr.objectId, into->viewQuery, key_field);
 #else
-	StoreImmvQuery(intoRelationAddr.objectId, (Query *) into->viewQuery);
+	StoreImmvQuery(intoRelationAddr.objectId, (Query *) into->viewQuery, key_field);
 #endif
 
 	CommandCounterIncrement();
@@ -178,7 +180,7 @@ create_immv_internal(List *attrList, IntoClause *into)
  * This imitates PostgreSQL's create_ctas_nodata().
  */
 static ObjectAddress
-create_immv_nodata(List *tlist, IntoClause *into)
+create_immv_nodata(List *tlist, IntoClause *into, const char *key_field)
 {
 	List	   *attrList;
 	ListCell   *t,
@@ -213,6 +215,15 @@ create_immv_nodata(List *tlist, IntoClause *into)
 								exprTypmod((Node *) tle->expr),
 								exprCollation((Node *) tle->expr));
 
+			if (key_field && strcmp(colname, key_field) == 0)
+			{
+				Constraint *notnull = makeNode(Constraint);
+
+				notnull->contype = CONSTR_NOTNULL;
+				col->constraints = lappend(col->constraints, notnull);
+				col->is_not_null = true;
+			}
+
 			/*
 			 * It's possible that the column is of a collatable type but the
 			 * collation could not be resolved, so double-check.  (We must
@@ -238,7 +249,7 @@ create_immv_nodata(List *tlist, IntoClause *into)
 				 errmsg("too many column names were specified")));
 
 	/* Create the relation definition using the ColumnDef list */
-	return create_immv_internal(attrList, into);
+	return create_immv_internal(attrList, into, key_field);
 }
 
 
@@ -249,7 +260,7 @@ create_immv_nodata(List *tlist, IntoClause *into)
  */
 ObjectAddress
 ExecCreateImmv(ParseState *pstate, CreateTableAsStmt *stmt,
-				  QueryCompletion *qc)
+				  QueryCompletion *qc, const char *key_field)
 {
 	Query	   *query = castNode(Query, stmt->query);
 	IntoClause *into = stmt->into;
@@ -279,9 +290,10 @@ ExecCreateImmv(ParseState *pstate, CreateTableAsStmt *stmt,
 				 errhint("functions must be marked IMMUTABLE")));
 
 	check_ivm_restriction((Node *) query);
+	validate_key_field(query, into->colNames, key_field);
 
 	/* For IMMV, we need to rewrite matview query */
-	query = rewriteQueryForIMMV(query, into->colNames);
+	query = rewriteQueryForIMMV(query, into->colNames, key_field);
 
 	/*
 	 * If WITH NO DATA was specified, do not go through the rewriter,
@@ -289,7 +301,7 @@ ExecCreateImmv(ParseState *pstate, CreateTableAsStmt *stmt,
 	 * similar to CREATE VIEW.  This avoids dump/restore problems stemming
 	 * from running the planner before all dependencies are set up.
 	 */
-	address = create_immv_nodata(query->targetList, into);
+	address = create_immv_nodata(query->targetList, into, key_field);
 
 	/*
 	 * For materialized views, reuse the REFRESH logic, which locks down
@@ -308,7 +320,7 @@ ExecCreateImmv(ParseState *pstate, CreateTableAsStmt *stmt,
 		matviewRel = table_open(address.objectId, NoLock);
 
 		/* Create an index on incremental maintainable materialized view, if possible */
-		CreateIndexOnIMMV(query, matviewRel);
+		CreateIndexOnIMMV(query, matviewRel, key_field);
 
 		/* Create triggers to prevent IMMV from being changed */
 		CreateChangePreventTrigger(address.objectId);
@@ -326,6 +338,7 @@ ExecCreateImmv(ParseState *pstate, CreateTableAsStmt *stmt,
 	return address;
 }
 
+
 /*
  * rewriteQueryForIMMV -- rewrite view definition query for IMMV
  *
@@ -338,7 +351,7 @@ ExecCreateImmv(ParseState *pstate, CreateTableAsStmt *stmt,
  * target list.
  */
 Query *
-rewriteQueryForIMMV(Query *query, List *colNames)
+rewriteQueryForIMMV(Query *query, List *colNames, const char *key_field)
 {
 	Query *rewritten;
 
@@ -421,6 +434,14 @@ rewriteQueryForIMMV(Query *query, List *colNames)
 	else if (!rewritten->hasAggs && rewritten->distinctClause)
 		rewritten->groupClause = transformDistinctClause(NULL, &rewritten->targetList, rewritten->sortClause, false);
 
+	if (key_field)
+	{
+		if (rewritten->hasAggs || rewritten->distinctClause || rewritten->groupClause || rewritten->hasSubLinks)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("key_field is only supported for simple SELECT queries without aggregates, DISTINCT, GROUP BY, or EXISTS")));
+	}
+
 	/* Add additional columns for aggregate values */
 	if (rewritten->hasAggs)
 	{
@@ -441,7 +462,7 @@ rewriteQueryForIMMV(Query *query, List *colNames)
 	}
 
 	/* Add count(*) for counting distinct tuples in views */
-	if (rewritten->distinctClause || rewritten->hasAggs)
+	if (!key_field && (rewritten->distinctClause || rewritten->hasAggs))
 	{
 		TargetEntry *tle;
 
@@ -463,6 +484,56 @@ rewriteQueryForIMMV(Query *query, List *colNames)
 	}
 
 	return rewritten;
+}
+
+static void
+validate_key_field(Query *query, List *colNames, const char *key_field)
+{
+	int		out_colno = 0;
+	bool	found = false;
+	ListCell *lc;
+
+	if (key_field == NULL)
+		return;
+
+	if (key_field[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("key_field must not be empty")));
+
+	if (query->hasAggs || query->distinctClause || query->groupClause || query->hasSubLinks)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("key_field is only supported for simple SELECT queries without aggregates, DISTINCT, GROUP BY, or EXISTS")));
+
+	foreach (lc, query->targetList)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+		char *outname;
+
+		if (tle->resjunk)
+			continue;
+
+		if (colNames && out_colno < list_length(colNames))
+			outname = strVal(list_nth(colNames, out_colno));
+		else
+			outname = tle->resname;
+
+		out_colno++;
+
+		if (outname && strcmp(outname, key_field) == 0)
+		{
+			found = true;
+			break;
+		}
+	}
+
+	if (!found)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("key_field must match a column in the view target list"),
+				 errdetail("No output column named \"%s\" was found.", key_field)));
+
 }
 
 /*
@@ -1553,15 +1624,16 @@ check_aggregate_supports_ivm(Oid aggfnoid)
  * is created on these attributes. In other cases, no index is created.
  */
 void
-CreateIndexOnIMMV(Query *query, Relation matviewRel)
+CreateIndexOnIMMV(Query *query, Relation matviewRel, const char *key_field)
 {
 	ListCell *lc;
 	IndexStmt  *index;
 	ObjectAddress address;
 	List *constraintList = NIL;
 	char		idxname[NAMEDATALEN];
-	List	   *indexoidlist = RelationGetIndexList(matviewRel);
+	List	   *indexoidlist;
 	ListCell   *indexoidscan;
+	Relation	rel = matviewRel;
 
 	/*
 	 * For aggregate without GROUP BY, we do not need to create an index
@@ -1570,7 +1642,7 @@ CreateIndexOnIMMV(Query *query, Relation matviewRel)
 	if (query->hasAggs && query->groupClause == NIL)
 		return;
 
-	snprintf(idxname, sizeof(idxname), "%s_index", RelationGetRelationName(matviewRel));
+	snprintf(idxname, sizeof(idxname), "%s_index", RelationGetRelationName(rel));
 
 	index = makeNode(IndexStmt);
 
@@ -1584,18 +1656,18 @@ CreateIndexOnIMMV(Query *query, Relation matviewRel)
 	//index->nulls_not_distinct = true;
 
 	index->unique = true;
-	index->primary = false;
-	index->isconstraint = false;
+	index->primary = (key_field != NULL);
+	index->isconstraint = (key_field != NULL);
 	index->deferrable = false;
 	index->initdeferred = false;
 	index->idxname = idxname;
 	index->relation =
-		makeRangeVar(get_namespace_name(RelationGetNamespace(matviewRel)),
-					 pstrdup(RelationGetRelationName(matviewRel)),
+		makeRangeVar(get_namespace_name(RelationGetNamespace(rel)),
+					 pstrdup(RelationGetRelationName(rel)),
 					 -1);
 	index->accessMethod = DEFAULT_INDEX_TYPE;
 	index->options = NIL;
-	index->tableSpace = get_tablespace_name(matviewRel->rd_rel->reltablespace);
+	index->tableSpace = get_tablespace_name(rel->rd_rel->reltablespace);
 	index->whereClause = NULL;
 	index->indexParams = NIL;
 	index->indexIncludingParams = NIL;
@@ -1614,14 +1686,39 @@ CreateIndexOnIMMV(Query *query, Relation matviewRel)
 	index->concurrent = false;
 	index->if_not_exists = false;
 
-	if (query->groupClause)
+	if (key_field)
+	{
+		int attnum;
+		Form_pg_attribute attr;
+		IndexElem  *iparam;
+
+		attnum = get_attnum(rel->rd_id, key_field);
+		if (attnum == InvalidAttrNumber)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("key_field \"%s\" does not exist in immv \"%s\"",
+							key_field, RelationGetRelationName(rel))));
+
+		attr = TupleDescAttr(rel->rd_att, attnum - 1);
+		iparam = makeNode(IndexElem);
+		iparam->name = pstrdup(NameStr(attr->attname));
+		iparam->expr = NULL;
+		iparam->indexcolname = NULL;
+		iparam->collation = NIL;
+		iparam->opclass = NIL;
+		iparam->opclassopts = NIL;
+		iparam->ordering = SORTBY_DEFAULT;
+		iparam->nulls_ordering = SORTBY_NULLS_DEFAULT;
+		index->indexParams = lappend(index->indexParams, iparam);
+	}
+	else if (query->groupClause)
 	{
 		/* create unique constraint on GROUP BY expression columns */
 		foreach(lc, query->groupClause)
 		{
 			SortGroupClause *scl = (SortGroupClause *) lfirst(lc);
 			TargetEntry *tle = get_sortgroupclause_tle(scl, query->targetList);
-			Form_pg_attribute attr = TupleDescAttr(matviewRel->rd_att, tle->resno - 1);
+			Form_pg_attribute attr = TupleDescAttr(rel->rd_att, tle->resno - 1);
 			IndexElem  *iparam;
 
 			iparam = makeNode(IndexElem);
@@ -1642,7 +1739,7 @@ CreateIndexOnIMMV(Query *query, Relation matviewRel)
 		foreach(lc, query->targetList)
 		{
 			TargetEntry *tle = (TargetEntry *) lfirst(lc);
-			Form_pg_attribute attr = TupleDescAttr(matviewRel->rd_att, tle->resno - 1);
+			Form_pg_attribute attr = TupleDescAttr(rel->rd_att, tle->resno - 1);
 			IndexElem  *iparam;
 
 			iparam = makeNode(IndexElem);
@@ -1668,7 +1765,7 @@ CreateIndexOnIMMV(Query *query, Relation matviewRel)
 			foreach(lc, query->targetList)
 			{
 				TargetEntry *tle = (TargetEntry *) lfirst(lc);
-				Form_pg_attribute attr = TupleDescAttr(matviewRel->rd_att, tle->resno - 1);
+				Form_pg_attribute attr = TupleDescAttr(rel->rd_att, tle->resno - 1);
 
 				if (bms_is_member(tle->resno - FirstLowInvalidHeapAttributeNumber, key_attnos))
 				{
@@ -1692,13 +1789,15 @@ CreateIndexOnIMMV(Query *query, Relation matviewRel)
 			/* create no index, just notice that an appropriate index is necessary for efficient IVM */
 			ereport(NOTICE,
 					(errmsg("could not create an index on immv \"%s\" automatically",
-							RelationGetRelationName(matviewRel)),
+							RelationGetRelationName(rel)),
 					 errdetail("This target list does not have all the primary key columns, "
 							   "or this view does not contain GROUP BY or DISTINCT clause."),
 					 errhint("Create an index on the immv for efficient incremental maintenance.")));
 			return;
 		}
 	}
+
+	indexoidlist = RelationGetIndexList(rel);
 
 	/* If we have a compatible index, we don't need to create another. */
 	foreach(indexoidscan, indexoidlist)
@@ -1758,6 +1857,7 @@ CreateIndexOnIMMV(Query *query, Relation matviewRel)
 
 		recordDependencyOn(&address, &refaddr, DEPENDENCY_NORMAL);
 	}
+
 }
 
 
@@ -1910,7 +2010,7 @@ get_primary_key_attnos_from_query(Query *query, List **constraintList)
  * Store the query for the IMMV to pg_ivm_immv
  */
 static void
-StoreImmvQuery(Oid viewOid, Query *viewQuery)
+StoreImmvQuery(Oid viewOid, Query *viewQuery, const char *key_field)
 {
 	char   *querytree = nodeToString((Node *) viewQuery);
 	Datum values[Natts_pg_ivm_immv];
@@ -1927,6 +2027,10 @@ StoreImmvQuery(Oid viewOid, Query *viewQuery)
 	values[Anum_pg_ivm_immv_ispopulated -1 ] = BoolGetDatum(false);
 	values[Anum_pg_ivm_immv_viewdef -1 ] = CStringGetTextDatum(querytree);
 	isNulls[Anum_pg_ivm_immv_lastivmupdate -1 ] = true;
+	if (key_field)
+		values[Anum_pg_ivm_immv_key_field - 1] = CStringGetTextDatum(key_field);
+	else
+		isNulls[Anum_pg_ivm_immv_key_field - 1] = true;
 
 	pgIvmImmv = table_open(PgIvmImmvRelationId(), RowExclusiveLock);
 

@@ -208,7 +208,7 @@ static RangeTblEntry *get_prestate_rte(RangeTblEntry *rte, MV_TriggerTable *tabl
 				 QueryEnvironment *queryEnv, Oid matviewid);
 static RangeTblEntry *union_ENRs(RangeTblEntry *rte, MV_TriggerTable *table, List *enr_rtes,
 		   const char *prefix, QueryEnvironment *queryEnv);
-static Query *rewrite_query_for_distinct_and_aggregates(Query *query, ParseState *pstate);
+static Query *rewrite_query_for_distinct_and_aggregates(Query *query, ParseState *pstate, bool set_semantics);
 
 static List *get_normalized_form(Query *query, Node *jtnode, Relids outer_join_rels,
 								 List **outerjoin_quals);
@@ -228,7 +228,8 @@ static ListCell *getRteListCell(Query *query, List *rte_path);
 static void apply_delta(Oid matviewOid, Tuplestorestate *old_tuplestores,Tuplestorestate *new_tuplestores,
 						TupleDesc tupdesc_old, TupleDesc tupdesc_new,
 						Query *query, bool use_count, char *count_colname,
-						List *terms, List *rte_path, List *outerjoin_relinfo);
+						List *terms, List *rte_path, List *outerjoin_relinfo,
+						const char *key_field);
 static void append_set_clause_for_count(const char *resname, StringInfo buf_old,
 							StringInfo buf_new,StringInfo aggs_list);
 static void append_set_clause_for_sum(const char *resname, StringInfo buf_old,
@@ -245,6 +246,8 @@ static char *get_null_condition_string(IvmOp op, const char *arg1, const char *a
 						  const char* count_col);
 static void apply_old_delta(const char *matviewname, const char *deltaname_old,
 				List *keys);
+static void apply_old_delta_set(const char *matviewname, const char *deltaname_old,
+				List *keys);
 static void apply_old_delta_with_count(const char *matviewname, const char *deltaname_old,
 				List *keys, StringInfo aggs_list, StringInfo aggs_set,
 				List *minmax_list, List *is_min_list,
@@ -252,6 +255,8 @@ static void apply_old_delta_with_count(const char *matviewname, const char *delt
 				SPITupleTable **tuptable_recalc, uint64 *num_recalc);
 static void apply_new_delta(const char *matviewname, const char *deltaname_new,
 				StringInfo target_list);
+static void apply_new_delta_set(const char *matviewname, const char *deltaname_new,
+				List *keys, StringInfo target_list, StringInfo set_clause);
 static void apply_new_delta_with_count(const char *matviewname, const char* deltaname_new,
 				List *keys, StringInfo target_list, StringInfo aggs_set,
 				const char* count_colname, bool distinct);
@@ -271,6 +276,8 @@ static void delete_dangling_tuples(List *terms, Query *query,
 					   List *outerjoin_relinfo);
 static void generate_equal(StringInfo querybuf, Oid opttype,
 			   const char *leftop, const char *rightop);
+
+static char *get_immv_key_field(Oid matviewOid);
 
 static void mv_InitHashTables(void);
 static SPIPlanPtr mv_FetchPreparedPlan(MV_QueryKey *key);
@@ -347,6 +354,7 @@ RefreshImmvByOid(Oid matviewOid, bool is_create, bool skipData,
 	int			save_nestlevel;
 	ObjectAddress address;
 	bool oldPopulated;
+	char   *key_field = NULL;
 
 	Relation pgIvmImmv;
 	TupleDesc tupdesc;
@@ -357,6 +365,7 @@ RefreshImmvByOid(Oid matviewOid, bool is_create, bool skipData,
 	Datum datum;
 
 	matviewRel = table_open(matviewOid, NoLock);
+	key_field = get_immv_key_field(matviewOid);
 	relowner = matviewRel->rd_rel->relowner;
 
 	/*
@@ -395,6 +404,10 @@ RefreshImmvByOid(Oid matviewOid, bool is_create, bool skipData,
 	datum = heap_getattr(tup, Anum_pg_ivm_immv_ispopulated, tupdesc, &isnull);
 	Assert(!isnull);
 	oldPopulated = DatumGetBool(datum);
+
+	datum = heap_getattr(tup, Anum_pg_ivm_immv_key_field, tupdesc, &isnull);
+	if (!isnull)
+		key_field = text_to_cstring(DatumGetTextPP(datum));
 
 	/*
 	 * Check for active uses of the relation in the current transaction, such
@@ -440,7 +453,7 @@ RefreshImmvByOid(Oid matviewOid, bool is_create, bool skipData,
 
 	/* For IMMV, we need to rewrite matview query */
 	if (!skipData)
-		dataQuery = rewriteQueryForIMMV(viewQuery,NIL);
+		dataQuery = rewriteQueryForIMMV(viewQuery, NIL, key_field);
 
 	tableSpace = matviewRel->rd_rel->reltablespace;
 	relpersistence = matviewRel->rd_rel->relpersistence;
@@ -765,6 +778,39 @@ get_immv_query(Relation matviewRel)
 	return query;
 }
 
+static char *
+get_immv_key_field(Oid matviewOid)
+{
+	Relation pgIvmImmv = table_open(PgIvmImmvRelationId(), AccessShareLock);
+	TupleDesc tupdesc = RelationGetDescr(pgIvmImmv);
+	SysScanDesc scan;
+	ScanKeyData key;
+	HeapTuple tup;
+	bool isnull;
+	Datum datum;
+	char *key_field = NULL;
+
+	ScanKeyInit(&key,
+				Anum_pg_ivm_immv_immvrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(matviewOid));
+	scan = systable_beginscan(pgIvmImmv, PgIvmImmvPrimaryKeyIndexId(),
+							  true, NULL, 1, &key);
+
+	tup = systable_getnext(scan);
+	if (HeapTupleIsValid(tup))
+	{
+		datum = heap_getattr(tup, Anum_pg_ivm_immv_key_field, tupdesc, &isnull);
+		if (!isnull)
+			key_field = text_to_cstring(DatumGetTextPP(datum));
+	}
+
+	systable_endscan(scan);
+	table_close(pgIvmImmv, NoLock);
+
+	return key_field;
+}
+
 static Tuplestorestate *
 tuplestore_copy(Tuplestorestate *tuplestore, Relation rel)
 {
@@ -926,6 +972,8 @@ IVM_immediate_maintenance(PG_FUNCTION_ARGS)
 	Relation	matviewRel;
 	int old_depth = immv_maintenance_depth;
 	SubTransactionId subxid;
+	char	   *key_field = NULL;
+	bool		set_semantics = false;
 
 	Oid			relowner;
 	Tuplestorestate *old_tuplestore = NULL;
@@ -1052,6 +1100,8 @@ IVM_immediate_maintenance(PG_FUNCTION_ARGS)
 	CommandCounterIncrement();
 
 	matviewRel = table_open(matviewOid, NoLock);
+	key_field = get_immv_key_field(matviewOid);
+	set_semantics = (key_field != NULL);
 
 	/* Make sure IMMV is a table. */
 	Assert(matviewRel->rd_rel->relkind == RELKIND_RELATION);
@@ -1214,7 +1264,7 @@ IVM_immediate_maintenance(PG_FUNCTION_ARGS)
 			Oid			OIDNewHeap;
 			DestReceiver *dest;
 			uint64		processed = 0;
-			Query	   *dataQuery = rewriteQueryForIMMV(query, NIL);
+			Query	   *dataQuery = rewriteQueryForIMMV(query, NIL, key_field);
 			char		relpersistence = matviewRel->rd_rel->relpersistence;
 
 			/*
@@ -1285,7 +1335,7 @@ IVM_immediate_maintenance(PG_FUNCTION_ARGS)
 	rewritten = rewrite_query_for_preupdate_state(rewritten, entry->tables,
 												  pstate, NIL, matviewOid);
 	/* Rewrite for DISTINCT clause and aggregates functions */
-	rewritten = rewrite_query_for_distinct_and_aggregates(rewritten, pstate);
+	rewritten = rewrite_query_for_distinct_and_aggregates(rewritten, pstate, set_semantics);
 
 	/* Create tuplestores to store view deltas */
 	if (entry->has_old)
@@ -1373,7 +1423,12 @@ IVM_immediate_maintenance(PG_FUNCTION_ARGS)
 				}
 			}
 
-			if (count_colname == NULL && (query->hasAggs || query->distinctClause))
+			if (set_semantics && in_exists)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("key_field is not supported with EXISTS subqueries")));
+
+			if (!set_semantics && count_colname == NULL && (query->hasAggs || query->distinctClause))
 			{
 				count_colname = pstrdup("__ivm_count__");
 				use_count = true;
@@ -1406,7 +1461,8 @@ IVM_immediate_maintenance(PG_FUNCTION_ARGS)
 				/* apply the delta tables to the materialized view */
 				apply_delta(matviewOid, old_tuplestore, new_tuplestore,
 							tupdesc_old, tupdesc_new, query, use_count,
-							count_colname, terms, rte_path, outerjoin_relinfo);
+							count_colname, terms, rte_path, outerjoin_relinfo,
+							key_field);
 			}
 			PG_CATCH();
 			{
@@ -1910,13 +1966,22 @@ union_ENRs(RangeTblEntry *rte, MV_TriggerTable *table, List *enr_rtes,
  * Rewrite query for counting DISTINCT clause and aggregate functions.
  */
 static Query *
-rewrite_query_for_distinct_and_aggregates(Query *query, ParseState *pstate)
+rewrite_query_for_distinct_and_aggregates(Query *query, ParseState *pstate, bool set_semantics)
 {
 	TargetEntry *tle_count;
 	FuncCall *fn;
 	Node *node;
 	int varno = 0;
 	ListCell *tbl_lc;
+
+	if (set_semantics)
+	{
+		if (query->hasAggs || query->distinctClause || query->groupClause || query->hasSubLinks)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("key_field is not supported with aggregates, DISTINCT, GROUP BY, or EXISTS")));
+		return query;
+	}
 
 	/* For aggregate views */
 	if (query->hasAggs)
@@ -2854,7 +2919,8 @@ static void
 apply_delta(Oid matviewOid, Tuplestorestate *old_tuplestores, Tuplestorestate *new_tuplestores,
 			TupleDesc tupdesc_old, TupleDesc tupdesc_new,
 			Query *query, bool use_count, char *count_colname,
-			List *terms, List *rte_path, List *outerjoin_relinfo)
+			List *terms, List *rte_path, List *outerjoin_relinfo,
+			const char *key_field)
 {
 	StringInfoData querybuf;
 	StringInfoData target_list_buf;
@@ -2868,6 +2934,9 @@ apply_delta(Oid matviewOid, Tuplestorestate *old_tuplestores, Tuplestorestate *n
 	List	   *keys = NIL;
 	List	   *minmax_list = NIL;
 	List	   *is_min_list = NIL;
+	bool		set_semantics = (key_field != NULL);
+	Form_pg_attribute key_attr = NULL;
+	StringInfoData set_clause_buf;
 
 
 	/*
@@ -2877,6 +2946,19 @@ apply_delta(Oid matviewOid, Tuplestorestate *old_tuplestores, Tuplestorestate *n
 	matviewRel = table_open(matviewOid, NoLock);
 	matviewname = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),
 											 RelationGetRelationName(matviewRel));
+
+	if (set_semantics)
+	{
+		int attnum = get_attnum(matviewRel->rd_id, key_field);
+
+		if (attnum == InvalidAttrNumber)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("key_field \"%s\" does not exist in immv \"%s\"",
+							key_field, RelationGetRelationName(matviewRel))));
+
+		key_attr = TupleDescAttr(matviewRel->rd_att, attnum - 1);
+	}
 
 	/*
 	 * Build parts of the maintenance queries
@@ -2919,9 +3001,9 @@ apply_delta(Oid matviewOid, Tuplestorestate *old_tuplestores, Tuplestorestate *n
 
 		/*
 		 * For views without aggregates, all attributes are used as keys to identify a
-		 * tuple in a view.
+		 * tuple in a view unless set semantics is enabled.
 		 */
-		if (!query->hasAggs)
+		if (!query->hasAggs && !set_semantics)
 			keys = lappend(keys, attr);
 
 		/* For views with aggregates, we need to build SET clause for updating aggregate
@@ -2965,6 +3047,11 @@ apply_delta(Oid matviewOid, Tuplestorestate *old_tuplestores, Tuplestorestate *n
 		}
 	}
 
+	if (set_semantics && (query->hasAggs || query->distinctClause || query->groupClause))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("key_field is not supported with aggregates, DISTINCT, or GROUP BY")));
+
 	/* If we have GROUP BY clause, we use its entries as keys. */
 	if (query->hasAggs && query->groupClause)
 	{
@@ -2975,6 +3062,29 @@ apply_delta(Oid matviewOid, Tuplestorestate *old_tuplestores, Tuplestorestate *n
 			Form_pg_attribute attr = TupleDescAttr(matviewRel->rd_att, tle->resno - 1);
 
 			keys = lappend(keys, attr);
+		}
+	}
+
+	if (set_semantics)
+	{
+		keys = list_make1(key_attr);
+		initStringInfo(&set_clause_buf);
+		for (i = 0; i < matviewRel->rd_att->natts; i++)
+		{
+			Form_pg_attribute attr = TupleDescAttr(matviewRel->rd_att, i);
+			char *resname = NameStr(attr->attname);
+
+			if (attr->attisdropped)
+				continue;
+
+			if (strcmp(resname, NameStr(key_attr->attname)) == 0)
+				continue;
+
+			if (set_clause_buf.len > 0)
+				appendStringInfoString(&set_clause_buf, ", ");
+			appendStringInfo(&set_clause_buf, "%s = %s",
+						quote_qualified_identifier(NULL, resname),
+						quote_qualified_identifier("diff", resname));
 		}
 	}
 
@@ -3011,6 +3121,8 @@ apply_delta(Oid matviewOid, Tuplestorestate *old_tuplestores, Tuplestorestate *n
 									   keys, aggs_list_buf, aggs_set_old,
 									   minmax_list, is_min_list,
 									   count_colname, &tuptable_recalc, &num_recalc);
+		else if (set_semantics)
+			apply_old_delta_set(matviewname, OLD_DELTA_ENRNAME, keys);
 		else
 			apply_old_delta(matviewname, OLD_DELTA_ENRNAME, keys);
 
@@ -3057,6 +3169,9 @@ apply_delta(Oid matviewOid, Tuplestorestate *old_tuplestores, Tuplestorestate *n
 			apply_new_delta_with_count(matviewname, NEW_DELTA_ENRNAME,
 								keys, &target_list_buf, aggs_set_new, count_colname,
 								query->distinctClause != NULL);
+		else if (set_semantics)
+			apply_new_delta_set(matviewname, NEW_DELTA_ENRNAME, keys, &target_list_buf,
+								&set_clause_buf);
 		else
 			apply_new_delta(matviewname, NEW_DELTA_ENRNAME, &target_list_buf);
 
@@ -3538,6 +3653,35 @@ apply_old_delta(const char *matviewname, const char *deltaname_old,
 }
 
 /*
+ * apply_old_delta_set
+ *
+ * Execute a query for applying a delta table given by deltaname_old
+ * which contains tuples to be deleted from a materialized view given by
+ * matviewname. This is used when set semantics are enabled.
+ */
+static void
+apply_old_delta_set(const char *matviewname, const char *deltaname_old,
+					List *keys)
+{
+	StringInfoData	querybuf;
+	char   *match_cond;
+
+	/* build WHERE condition for searching tuples to be deleted */
+	match_cond = get_matching_condition_string(keys);
+
+	/* Delete matching tuples by key */
+	initStringInfo(&querybuf);
+	appendStringInfo(&querybuf,
+		"DELETE FROM %s AS mv USING %s AS diff WHERE %s",
+		matviewname,
+		deltaname_old,
+		match_cond);
+
+	if (SPI_exec(querybuf.data, 0) != SPI_OK_DELETE)
+		elog(ERROR, "SPI_exec failed: %s", querybuf.data);
+}
+
+/*
  * apply_new_delta_with_count
  *
  * Execute a query for applying a delta table given by deltaname_new
@@ -3645,6 +3789,49 @@ apply_new_delta(const char *matviewname, const char *deltaname_new,
 						"FROM %s AS diff) AS v",
 					matviewname, target_list->data, target_list->data,
 					deltaname_new);
+
+	if (SPI_exec(querybuf.data, 0) != SPI_OK_INSERT)
+		elog(ERROR, "SPI_exec failed: %s", querybuf.data);
+}
+
+/*
+ * apply_new_delta_set
+ *
+ * Execute a query for applying a delta table given by deltaname_new
+ * which contains tuples to be inserted into a materialized view given by
+ * matviewname. This is used when set semantics are enabled.
+ */
+static void
+apply_new_delta_set(const char *matviewname, const char *deltaname_new,
+				List *keys, StringInfo target_list, StringInfo set_clause)
+{
+	StringInfoData	querybuf;
+	char   *match_cond;
+
+	match_cond = get_matching_condition_string(keys);
+
+	initStringInfo(&querybuf);
+	if (set_clause && set_clause->len > 0)
+	{
+		appendStringInfo(&querybuf,
+					"UPDATE %s AS mv SET %s FROM %s AS diff WHERE %s",
+					matviewname,
+					set_clause->data,
+					deltaname_new,
+					match_cond);
+
+		if (SPI_exec(querybuf.data, 0) != SPI_OK_UPDATE)
+			elog(ERROR, "SPI_exec failed: %s", querybuf.data);
+	}
+
+	initStringInfo(&querybuf);
+	appendStringInfo(&querybuf,
+					"INSERT INTO %s (%s) "
+					"SELECT %s FROM %s AS diff "
+					"WHERE NOT EXISTS (SELECT 1 FROM %s AS mv WHERE %s)",
+					matviewname, target_list->data,
+					target_list->data, deltaname_new,
+					matviewname, match_cond);
 
 	if (SPI_exec(querybuf.data, 0) != SPI_OK_INSERT)
 		elog(ERROR, "SPI_exec failed: %s", querybuf.data);

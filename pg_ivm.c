@@ -175,8 +175,10 @@ create_immv(PG_FUNCTION_ARGS)
 {
 	text	*t_relname = PG_GETARG_TEXT_PP(0);
 	text	*t_sql = PG_GETARG_TEXT_PP(1);
+	text	*t_key_field = (PG_NARGS() > 2 && !PG_ARGISNULL(2)) ? PG_GETARG_TEXT_PP(2) : NULL;
 	char	*relname = text_to_cstring(t_relname);
 	char	*sql = text_to_cstring(t_sql);
+	char	*key_field = t_key_field ? text_to_cstring(t_key_field) : NULL;
 	List	*parsetree_list;
 	RawStmt	*parsetree;
 	Query	*query;
@@ -191,7 +193,10 @@ create_immv(PG_FUNCTION_ARGS)
 	parseNameAndColumns(relname, &names, &colNames);
 
 	initStringInfo(&command_buf);
-	appendStringInfo(&command_buf, "SELECT create_immv('%s' AS '%s');", relname, sql);
+	if (key_field)
+		appendStringInfo(&command_buf, "SELECT create_immv('%s', '%s', '%s');", relname, sql, key_field);
+	else
+		appendStringInfo(&command_buf, "SELECT create_immv('%s', '%s');", relname, sql);
 	appendStringInfo(&command_buf, "%s;", sql);
 	pstate->p_sourcetext = command_buf.data;
 
@@ -234,7 +239,7 @@ create_immv(PG_FUNCTION_ARGS)
 	query = transformStmt(pstate, (Node *) ctas);
 	Assert(query->commandType == CMD_UTILITY && IsA(query->utilityStmt, CreateTableAsStmt));
 
-	ExecCreateImmv(pstate, (CreateTableAsStmt *) query->utilityStmt, &qc);
+	ExecCreateImmv(pstate, (CreateTableAsStmt *) query->utilityStmt, &qc, key_field);
 
 	PG_RETURN_INT64(qc.nprocessed);
 }

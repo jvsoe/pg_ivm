@@ -20,12 +20,13 @@
 #include "tcop/dest.h"
 #include "utils/queryenvironment.h"
 
-#define Natts_pg_ivm_immv 4
+#define Natts_pg_ivm_immv 5
 
 #define Anum_pg_ivm_immv_immvrelid 1
 #define Anum_pg_ivm_immv_viewdef 2
 #define Anum_pg_ivm_immv_ispopulated 3
 #define Anum_pg_ivm_immv_lastivmupdate 4
+#define Anum_pg_ivm_immv_key_field 5
 
 /* pg_ivm.c */
 
@@ -38,10 +39,10 @@ extern List *PgIvmFuncName(char *name);
 /* createas.c */
 
 extern ObjectAddress ExecCreateImmv(ParseState *pstate, CreateTableAsStmt *stmt,
-									QueryCompletion *qc);
+									QueryCompletion *qc, const char *key_field);
 extern void CreateIvmTriggersOnBaseTables(Query *qry, Oid matviewOid);
-extern void CreateIndexOnIMMV(Query *query, Relation matviewRel);
-extern Query *rewriteQueryForIMMV(Query *query, List *colNames);
+extern void CreateIndexOnIMMV(Query *query, Relation matviewRel, const char *key_field);
+extern Query *rewriteQueryForIMMV(Query *query, List *colNames, const char *key_field);
 extern void makeIvmAggColumn(ParseState *pstate, Aggref *aggref, char *resname, AttrNumber *next_resno, List **aggs);
 
 /* matview.c */
