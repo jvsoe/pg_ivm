@@ -22,7 +22,7 @@ DATA = pg_ivm--1.0.sql \
        pg_ivm--1.10--1.11.sql pg_ivm--1.11--1.12.sql pg_ivm--1.12--1.13.sql \
        pg_ivm--1.13.sql pg_ivm--1.13--1.13+keyfield.sql pg_ivm--1.13+keyfield.sql
 
-REGRESS = pg_ivm create_immv refresh_immv outer_join
+REGRESS = pg_ivm create_immv refresh_immv outer_join nullability
 
 PGVER = $(shell $(PG_CONFIG) --version | sed "s/^[^ ]* \([0-9]*\).*$$/\1/" 2>/dev/null)
 

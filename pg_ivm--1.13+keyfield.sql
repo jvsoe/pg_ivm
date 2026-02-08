@@ -16,9 +16,14 @@ SELECT pg_catalog.pg_extension_config_dump('pgivm.pg_ivm_immv', '');
 
 -- functions
 
-CREATE FUNCTION pgivm.create_immv(text, text, text DEFAULT NULL)
+CREATE FUNCTION pgivm.create_immv(text, text)
 RETURNS bigint 
 STRICT
+AS 'MODULE_PATHNAME', 'create_immv'
+LANGUAGE C;
+
+CREATE FUNCTION pgivm.create_immv(text, text, text)
+RETURNS bigint 
 AS 'MODULE_PATHNAME', 'create_immv'
 LANGUAGE C;
 

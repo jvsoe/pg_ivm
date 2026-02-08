@@ -64,7 +64,11 @@ typedef struct
 
 /* utility functions for IMMV definition creation */
 static ObjectAddress create_immv_internal(List *attrList, IntoClause *into, const char *key_field);
-static ObjectAddress create_immv_nodata(List *tlist, IntoClause *into, const char *key_field);
+static ObjectAddress create_immv_nodata(List *tlist, IntoClause *into, const char *key_field, Query *query);
+static Relids immv_query_nullable_relids(const Query *query);
+static Relids immv_relids_in_jointree(Node *node);
+static void immv_collect_nullable_relids(Node *node, Relids *nullable_relids);
+static bool immv_target_is_not_null(const Query *query, const TargetEntry *tle, Relids nullable_relids);
 
 typedef struct
 {
@@ -180,11 +184,12 @@ create_immv_internal(List *attrList, IntoClause *into, const char *key_field)
  * This imitates PostgreSQL's create_ctas_nodata().
  */
 static ObjectAddress
-create_immv_nodata(List *tlist, IntoClause *into, const char *key_field)
+create_immv_nodata(List *tlist, IntoClause *into, const char *key_field, Query *query)
 {
 	List	   *attrList;
 	ListCell   *t,
 			   *lc;
+	Relids		nullable_relids = immv_query_nullable_relids(query);
 
 	/*
 	 * Build list of ColumnDefs from non-junk elements of the tlist.  If a
@@ -214,6 +219,15 @@ create_immv_nodata(List *tlist, IntoClause *into, const char *key_field)
 								exprType((Node *) tle->expr),
 								exprTypmod((Node *) tle->expr),
 								exprCollation((Node *) tle->expr));
+
+			if (!isIvmName(colname) && immv_target_is_not_null(query, tle, nullable_relids))
+			{
+				Constraint *notnull = makeNode(Constraint);
+
+				notnull->contype = CONSTR_NOTNULL;
+				col->constraints = lappend(col->constraints, notnull);
+				col->is_not_null = true;
+			}
 
 			if (key_field && strcmp(colname, key_field) == 0)
 			{
@@ -248,8 +262,187 @@ create_immv_nodata(List *tlist, IntoClause *into, const char *key_field)
 				(errcode(ERRCODE_SYNTAX_ERROR),
 				 errmsg("too many column names were specified")));
 
+	if (nullable_relids)
+		bms_free(nullable_relids);
+
 	/* Create the relation definition using the ColumnDef list */
 	return create_immv_internal(attrList, into, key_field);
+}
+
+static Relids
+immv_query_nullable_relids(const Query *query)
+{
+	Relids nullable_relids = NULL;
+	Relids nonnullable_rels = NULL;
+
+	if (query->jointree)
+		immv_collect_nullable_relids((Node *) query->jointree, &nullable_relids);
+
+	if (query->jointree && query->jointree->quals)
+		nonnullable_rels = find_nonnullable_rels((Node *) query->jointree->quals);
+
+	if (nonnullable_rels)
+	{
+		nullable_relids = bms_del_members(nullable_relids, nonnullable_rels);
+		bms_free(nonnullable_rels);
+	}
+
+	return nullable_relids;
+}
+
+static Relids
+immv_relids_in_jointree(Node *node)
+{
+	Relids relids = NULL;
+
+	if (node == NULL)
+		return NULL;
+
+	switch (nodeTag(node))
+	{
+		case T_RangeTblRef:
+			{
+				RangeTblRef *rtr = (RangeTblRef *) node;
+
+				return bms_make_singleton(rtr->rtindex);
+			}
+		case T_JoinExpr:
+			{
+				JoinExpr *joinexpr = (JoinExpr *) node;
+				Relids left = immv_relids_in_jointree(joinexpr->larg);
+				Relids right = immv_relids_in_jointree(joinexpr->rarg);
+
+				relids = bms_union(left, right);
+				if (left)
+					bms_free(left);
+				if (right)
+					bms_free(right);
+
+				return relids;
+			}
+		case T_FromExpr:
+			{
+				FromExpr *from = (FromExpr *) node;
+				ListCell *lc;
+
+				foreach(lc, from->fromlist)
+				{
+					Relids item_relids = immv_relids_in_jointree((Node *) lfirst(lc));
+					relids = bms_union(relids, item_relids);
+					if (item_relids)
+						bms_free(item_relids);
+				}
+
+				return relids;
+			}
+		default:
+			return NULL;
+	}
+}
+
+static void
+immv_collect_nullable_relids(Node *node, Relids *nullable_relids)
+{
+	if (node == NULL)
+		return;
+
+	switch (nodeTag(node))
+	{
+		case T_FromExpr:
+			{
+				FromExpr *from = (FromExpr *) node;
+				ListCell *lc;
+
+				foreach(lc, from->fromlist)
+					immv_collect_nullable_relids((Node *) lfirst(lc), nullable_relids);
+				break;
+			}
+		case T_JoinExpr:
+			{
+				JoinExpr *joinexpr = (JoinExpr *) node;
+				Relids relids = NULL;
+
+				if (IS_OUTER_JOIN(joinexpr->jointype))
+				{
+					if (joinexpr->jointype == JOIN_LEFT)
+						relids = immv_relids_in_jointree(joinexpr->rarg);
+					else if (joinexpr->jointype == JOIN_RIGHT)
+						relids = immv_relids_in_jointree(joinexpr->larg);
+					else if (joinexpr->jointype == JOIN_FULL)
+					{
+						Relids left = immv_relids_in_jointree(joinexpr->larg);
+						Relids right = immv_relids_in_jointree(joinexpr->rarg);
+
+						relids = bms_union(left, right);
+						if (left)
+							bms_free(left);
+						if (right)
+							bms_free(right);
+					}
+
+					*nullable_relids = bms_union(*nullable_relids, relids);
+					if (relids)
+						bms_free(relids);
+				}
+
+				immv_collect_nullable_relids(joinexpr->larg, nullable_relids);
+				immv_collect_nullable_relids(joinexpr->rarg, nullable_relids);
+				break;
+			}
+		default:
+			break;
+	}
+}
+
+static bool
+immv_target_is_not_null(const Query *query, const TargetEntry *tle, Relids nullable_relids)
+{
+	Var		*var;
+	RangeTblEntry *rte;
+	HeapTuple	att_tup;
+	Form_pg_attribute att;
+	bool		result = false;
+
+	if (isIvmName(tle->resname))
+		return false;
+
+	if (IsA(tle->expr, Aggref))
+	{
+		Aggref *aggref = (Aggref *) tle->expr;
+
+		if (aggref->aggfnoid == F_COUNT_ANY || aggref->aggfnoid == F_COUNT_)
+			return true;
+		return false;
+	}
+
+	if (!IsA(tle->expr, Var))
+		return false;
+
+	var = (Var *) tle->expr;
+	if (var->varlevelsup != 0 || var->varattno <= 0)
+		return false;
+
+	if (nullable_relids && bms_is_member(var->varno, nullable_relids))
+		return false;
+
+	if (var->varno <= 0 || var->varno > list_length(query->rtable))
+		return false;
+
+	rte = (RangeTblEntry *) list_nth(query->rtable, var->varno - 1);
+	if (rte->rtekind != RTE_RELATION)
+		return false;
+
+	att_tup = SearchSysCache2(ATTNUM,
+								ObjectIdGetDatum(rte->relid),
+								Int16GetDatum(var->varattno));
+	if (!HeapTupleIsValid(att_tup))
+		return false;
+
+	att = (Form_pg_attribute) GETSTRUCT(att_tup);
+	result = att->attnotnull;
+	ReleaseSysCache(att_tup);
+
+	return result;
 }
 
 
@@ -301,7 +494,7 @@ ExecCreateImmv(ParseState *pstate, CreateTableAsStmt *stmt,
 	 * similar to CREATE VIEW.  This avoids dump/restore problems stemming
 	 * from running the planner before all dependencies are set up.
 	 */
-	address = create_immv_nodata(query->targetList, into, key_field);
+	address = create_immv_nodata(query->targetList, into, key_field, query);
 
 	/*
 	 * For materialized views, reuse the REFRESH logic, which locks down
