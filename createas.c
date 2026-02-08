@@ -434,14 +434,6 @@ rewriteQueryForIMMV(Query *query, List *colNames, const char *key_field)
 	else if (!rewritten->hasAggs && rewritten->distinctClause)
 		rewritten->groupClause = transformDistinctClause(NULL, &rewritten->targetList, rewritten->sortClause, false);
 
-	if (key_field)
-	{
-		if (rewritten->hasAggs || rewritten->distinctClause || rewritten->groupClause || rewritten->hasSubLinks)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("key_field is only supported for simple SELECT queries without aggregates, DISTINCT, GROUP BY, or EXISTS")));
-	}
-
 	/* Add additional columns for aggregate values */
 	if (rewritten->hasAggs)
 	{

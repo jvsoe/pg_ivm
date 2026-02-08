@@ -365,7 +365,6 @@ RefreshImmvByOid(Oid matviewOid, bool is_create, bool skipData,
 	Datum datum;
 
 	matviewRel = table_open(matviewOid, NoLock);
-	key_field = get_immv_key_field(matviewOid);
 	relowner = matviewRel->rd_rel->relowner;
 
 	/*
@@ -1139,6 +1138,11 @@ IVM_immediate_maintenance(PG_FUNCTION_ARGS)
 
 	/* get view query*/
 	query = get_immv_query(matviewRel);
+	if (set_semantics && (query->hasAggs || query->distinctClause ||
+					  query->groupClause || query->hasSubLinks))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("key_field is only supported for simple SELECT queries without aggregates, DISTINCT, GROUP BY, or EXISTS")));
 
 	/* join tree analysis for outer join */
 	i = 1;
@@ -1422,11 +1426,6 @@ IVM_immediate_maintenance(PG_FUNCTION_ARGS)
 					}
 				}
 			}
-
-			if (set_semantics && in_exists)
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("key_field is not supported with EXISTS subqueries")));
 
 			if (!set_semantics && count_colname == NULL && (query->hasAggs || query->distinctClause))
 			{
@@ -1975,13 +1974,7 @@ rewrite_query_for_distinct_and_aggregates(Query *query, ParseState *pstate, bool
 	ListCell *tbl_lc;
 
 	if (set_semantics)
-	{
-		if (query->hasAggs || query->distinctClause || query->groupClause || query->hasSubLinks)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("key_field is not supported with aggregates, DISTINCT, GROUP BY, or EXISTS")));
 		return query;
-	}
 
 	/* For aggregate views */
 	if (query->hasAggs)
@@ -3046,11 +3039,6 @@ apply_delta(Oid matviewOid, Tuplestorestate *old_tuplestores, Tuplestorestate *n
 				elog(ERROR, "unsupported aggregate function: %s", aggname);
 		}
 	}
-
-	if (set_semantics && (query->hasAggs || query->distinctClause || query->groupClause))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("key_field is not supported with aggregates, DISTINCT, or GROUP BY")));
 
 	/* If we have GROUP BY clause, we use its entries as keys. */
 	if (query->hasAggs && query->groupClause)
